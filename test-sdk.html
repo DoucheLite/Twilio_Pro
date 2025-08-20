@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Twilio SDK Test</title>
+</head>
+<body>
+    <h1>Twilio SDK Test</h1>
+    <div id="result"></div>
+
+    <script src="frontend/public/twilio.min.js"></script>
+    <script>
+        const resultDiv = document.getElementById('result');
+        
+        // Test if Twilio SDK loaded
+        if (typeof window.Twilio !== 'undefined') {
+            console.log('✅ Twilio SDK loaded successfully');
+            console.log('Twilio object:', window.Twilio);
+            console.log('Device available:', typeof window.Twilio.Device);
+            
+            resultDiv.innerHTML = `
+                <p style="color: green;">✅ Twilio SDK loaded successfully!</p>
+                <p>Device constructor available: ${typeof window.Twilio.Device}</p>
+                <p>SDK version: ${window.Twilio.Device ? 'Available' : 'Not available'}</p>
+            `;
+        } else {
+            console.error('❌ Twilio SDK not loaded');
+            resultDiv.innerHTML = '<p style="color: red;">❌ Twilio SDK not loaded</p>';
+        }
+    </script>
+</body>
+</html> 

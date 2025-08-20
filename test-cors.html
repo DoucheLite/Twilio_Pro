@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CORS Test</title>
+</head>
+<body>
+    <h1>CORS Test</h1>
+    <button onclick="testToken()">Test Token API</button>
+    <div id="result"></div>
+
+    <script>
+        async function testToken() {
+            const resultDiv = document.getElementById('result');
+            try {
+                console.log('Testing direct API call to backend...');
+                const response = await fetch('http://localhost:5001/api/token', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({})
+                });
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    console.log('Token API success:', data);
+                    resultDiv.innerHTML = `<p style="color: green;">✅ Success! Token received. Identity: ${data.identity}</p>`;
+                } else {
+                    const error = await response.text();
+                    console.error('Token API error:', error);
+                    resultDiv.innerHTML = `<p style="color: red;">❌ Error: ${error}</p>`;
+                }
+            } catch (error) {
+                console.error('CORS or network error:', error);
+                resultDiv.innerHTML = `<p style="color: red;">❌ CORS/Network Error: ${error.message}</p>`;
+            }
+        }
+    </script>
+</body>
+</html> 
