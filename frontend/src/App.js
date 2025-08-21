@@ -1,10 +1,31 @@
 import React, { useEffect, useRef, useState } from "react";
+
+// --- Twilio SDK waiter: resolves once window.Twilio.Device exists ---
+function waitForTwilio(timeout = 7000) {
+  return new Promise((resolve) => {
+    if (window.Twilio?.Device) return resolve(window.Twilio);
+    const start = Date.now();
+    const t = setInterval(() => {
+      if (window.Twilio?.Device) {
+        clearInterval(t);
+        resolve(window.Twilio);
+      } else if (Date.now() - start > timeout) {
+        clearInterval(t);
+        resolve(null);
+      }
+    }, 50);
+  });
+}
+
 class ErrorBoundary extends React.Component { constructor(p){ super(p); this.state={hasError:false,error:null}; } static getDerivedStateFromError(e){return{hasError:true,error:e}} componentDidCatch(e,i){console.error("UI Error:",e,i)} render(){ return this.state.hasError? (<div className="p-4 m-4 rounded border border-red-300 bg-red-50 text-red-700"><h2 className="font-semibold mb-2">Something went wrong.</h2><pre className="text-xs whitespace-pre-wrap">{String(this.state.error)}</pre></div>): this.props.children; } }
 const LS={contacts:"twilio_pro_contacts",history:"twilio_pro_history"};
 const useLocal=(k,i)=>{ const [v,s]=useState(()=>{try{const r=localStorage.getItem(k);return r?JSON.parse(r):i}catch{return i}}); useEffect(()=>{try{localStorage.setItem(k,JSON.stringify(v))}catch{}},[k,v]); return [v,s]; };
 const norm=(t)=>{ if(!t) return ""; const c=t.replace(/[^\d+]/g,""); const plus=c.startsWith("+")?"+":""; const d=c.replace(/\D/g,""); return plus+d; };
 const fmt=(t)=>{ const r=norm(t); if(r.startsWith("+")||r.length<=3) return r; const d=r.replace(/\D/g,""); if(d.length===10) return `(${d.slice(0,3)}) ${d.slice(3,6)}-${d.slice(6)}`; if(d.length>6) return `${d.slice(0,3)}-${d.slice(3,6)}-${d.slice(6)}`; if(d.length>3) return `${d.slice(0,3)}-${d.slice(3)}`; return d; };
 export default function App(){
+  // Helper function to generate unique IDs
+  const generateId = () => Date.now() + Math.random();
+  
   const [devStat,setDevStat]=useState("offline");
   const [callStat,setCallStat]=useState("idle");
   const [err,setErr]=useState("");
@@ -23,16 +44,126 @@ export default function App(){
   const [contactContext,setContactContext]=useState(null);
   const [showContactDetails,setShowContactDetails]=useState(false);
   const deviceRef=useRef(null); const actRef=useRef(null); const incRef=useRef(null); const tRef=useRef(null);
-  useEffect(()=>{ let mounted=true; (async()=>{ try{
-      if(!window.Twilio||!window.Twilio.Device){ setErr("Twilio SDK not loaded. Check index.html."); return; }
-      const r=await fetch('http://localhost:5001/api/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})}); const j=await r.json(); if(!r.ok) throw new Error(j?.error||'Failed to fetch token'); if(!mounted) return; setId(j.identity||'');
-      const dev=new window.Twilio.Device(j.token,{logLevel:process.env.NODE_ENV==='development'?'warn':'error',codecPreferences:['opus','pcmu'],enableRingingState:true}); deviceRef.current=dev; setDevStat('registering');
-      const onReg=()=>setDevStat('ready'); const onUnreg=()=>setDevStat('offline'); const onErr=(e)=>{console.error('Device error',e); setErr(e?.message||String(e)); setDevStat('error')}; const onInc=(c)=>{incRef.current=c; setCallStat('incoming'); c.on('cancel',()=>{ if(incRef.current===c) incRef.current=null; setCallStat('idle'); }); };
-      dev.on('registered',onReg); dev.on('unregistered',onUnreg); dev.on('error',onErr); dev.on('incoming',onInc);
-      await dev.register();
-    }catch(e){ console.error(e); setErr(e.message||String(e)); setDevStat('error'); } })();
-    return ()=>{ mounted=false; clearTimeout(tRef.current); try{deviceRef.current?.removeAllListeners?.(); deviceRef.current?.destroy?.(); deviceRef.current=null;}catch{} };
-  },[]);
+  useEffect(() => {
+    let mounted = true;
+    let device; // for cleanup on unmount
+
+    (async () => {
+      // 1) Wait for the SDK to exist on window
+      const Twilio = await waitForTwilio(7000);
+      if (!mounted) return;
+
+      if (!Twilio?.Device) {
+        console.warn('❌ Twilio SDK not found after waiting');
+        setDevStat('error');
+        setErr('Twilio SDK not loaded');
+        return;
+      }
+
+      try {
+        setDevStat('loading');
+
+        // 2) Get access token from backend
+        const r = await fetch('http://localhost:5001/api/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        });
+        if (!r.ok) throw new Error(`Token fetch failed ${r.status}`);
+        const j = await r.json();
+        setId(j.identity || '');
+
+        // 3) Spin up the Device
+        device = new Twilio.Device(j.token, {
+          logLevel: process.env.NODE_ENV === 'development' ? 'warn' : 'error',
+          codecPreferences: ['opus', 'pcmu'],
+          enableRingingState: true,
+          allowIncomingWhileBusy: false,
+          // Trim sounds to reduce AudioContext warnings (optional)
+          sounds: { incoming: false, outgoing: false, disconnect: false },
+          // edge: ['ashburn', 'sanjose'], // optional: choose edges near you
+        });
+
+        deviceRef.current = device;
+
+        // 4) Wire events → update your UI status pills
+        device.on('ready', () => {
+          if (!mounted) return;
+          console.log('✅ Device ready');
+          setDevStat('ready');
+        });
+
+        device.on('error', (e) => {
+          if (!mounted) return;
+          console.error('Device error:', e);
+          // Don't show AudioContext errors to users
+          if (e?.message?.includes('AudioContext')) {
+            console.log('AudioContext warning suppressed');
+            return;
+          }
+          setDevStat('error');
+          setErr(e?.message || 'Device error');
+        });
+
+        device.on('tokenWillExpire', async () => {
+          try {
+            const r2 = await fetch('http://localhost:5001/api/token', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({})
+            });
+            if (!r2.ok) throw new Error(`Token refresh failed ${r2.status}`);
+            const j2 = await r2.json();
+            device.updateToken(j2.token);
+            console.log('🔄 Token refreshed');
+          } catch (err) {
+            console.error('Token refresh error', err);
+          }
+        });
+
+        device.on('tokenExpired', () => {
+          if (!mounted) return;
+          console.warn('Token expired');
+          setDevStat('error');
+          setErr('Token expired – retry');
+        });
+
+        device.on('incoming', (c) => {
+          incRef.current = c;
+          setCallStat('incoming');
+          c.on('cancel', () => {
+            if (incRef.current === c) incRef.current = null;
+            setCallStat('idle');
+          });
+        });
+
+        // Register the device
+        await device.register();
+      } catch (err) {
+        console.error('Init error:', err);
+        if (!mounted) return;
+        setDevStat('error');
+        setErr(String(err.message || err));
+      }
+    })();
+
+    return () => {
+      mounted = false;
+      try { device?.destroy(); } catch {}
+    };
+  }, []);
+  
+  // TEMPORARY: Clear old localStorage data with duplicate keys
+  useEffect(() => {
+    // Check if we need to clear old data
+    const needsClear = localStorage.getItem('twilio_pro_clear_done');
+    if (!needsClear) {
+      localStorage.removeItem('twilio_pro_history');
+      localStorage.removeItem('twilio_pro_contacts');
+      localStorage.setItem('twilio_pro_clear_done', 'true');
+      console.log('Cleared old localStorage data with duplicate keys');
+    }
+  }, []);
   
   // Fetch recordings, transcriptions, and contacts on mount
   useEffect(() => {
@@ -50,7 +181,16 @@ export default function App(){
     if(!deviceRef.current){ 
       setErr('Device not ready.'); 
       return; 
-    } 
+    }
+    
+    // Check if there's already an active call
+    if(actRef.current && actRef.current.status() !== 'closed') {
+      setErr('Please hang up the current call first.');
+      return;
+    }
+    
+    // Clear any lingering call references
+    actRef.current = null;
     
     try {
       setCallStat('dialing'); 
@@ -64,7 +204,7 @@ export default function App(){
         setIsRecording(true); // Start recording indicator
       }); 
       call.on('disconnect',()=>{ 
-        setHist(l=>[{id:Date.now(),to:n,direction:'outgoing',status:'completed',at:new Date().toISOString()},...l].slice(0,100)); 
+        setHist(l=>[{id:generateId(),to:n,direction:'outgoing',status:'completed',at:new Date().toISOString()},...l].slice(0,100)); 
         actRef.current=null; 
         setCallStat('idle'); 
         setIsRecording(false); // Stop recording indicator
@@ -73,17 +213,39 @@ export default function App(){
         fetchContacts(); // Refresh contacts list
       }); 
       call.on('cancel',()=>{ 
-        setHist(l=>[{id:Date.now(),to:n,direction:'outgoing',status:'canceled',at:new Date().toISOString()},...l].slice(0,100)); 
+        setHist(l=>[{id:generateId(),to:n,direction:'outgoing',status:'canceled',at:new Date().toISOString()},...l].slice(0,100)); 
         actRef.current=null; 
         setCallStat('idle'); 
         setIsRecording(false); // Stop recording indicator
       }); 
-      call.on('error',e=>{
+      call.on('error', e => {
         console.error('Call error:', e);
-        setErr(e?.message||'Call error');
+        
+        // Handle hangup errors as normal disconnections
+        if (e.code === 31005) {
+          console.log('Call ended with gateway hangup error (31005) - treating as normal hangup');
+          setHist(l => [{
+            id: generateId(),
+            to: n,
+            direction: 'outgoing',
+            status: 'completed',
+            at: new Date().toISOString()
+          }, ...l].slice(0, 100));
+          
+          actRef.current = null;
+          setCallStat('idle');
+          setIsRecording(false);
+          fetchRecordings();
+          fetchTranscriptions();
+          fetchContacts();
+          return; // Don't show error to user
+        }
+        
+        // Handle other errors normally
+        setErr(e?.message || 'Call error');
         setCallStat('idle');
-        actRef.current=null;
-        setIsRecording(false); // Stop recording indicator
+        actRef.current = null;
+        setIsRecording(false);
       });
     } catch (error) {
       console.error('Failed to start call:', error);
@@ -91,7 +253,21 @@ export default function App(){
       setCallStat('idle');
     }
   };
-  const hang=()=>{ try{actRef.current?.disconnect()}catch{} };
+  const hang = () => {
+    try {
+      const call = actRef.current;
+      if (call && call.status() !== 'closed') {
+        call.disconnect();
+      }
+    } catch (error) {
+      console.log('Error during hangup:', error);
+    }
+    
+    // Always clean up state regardless of disconnect success
+    actRef.current = null;
+    setCallStat('idle');
+    setIsRecording(false);
+  };
   const dtmf=(d)=>{ try{actRef.current?.sendDigits(d)}catch{} };
   const accept=async()=>{ 
     const c=incRef.current; 
@@ -103,7 +279,7 @@ export default function App(){
       setCallStat('connected'); 
       
       c.on('disconnect',()=>{ 
-        setHist(l=>[{id:Date.now(),from:c.parameters?.From||'unknown',direction:'incoming',status:'completed',at:new Date().toISOString()},...l].slice(0,100)); 
+        setHist(l=>[{id:generateId(),from:c.parameters?.From||'unknown',direction:'incoming',status:'completed',at:new Date().toISOString()},...l].slice(0,100)); 
         if(incRef.current===c) incRef.current=null; 
         actRef.current=null; 
         setCallStat('idle'); 
@@ -113,13 +289,36 @@ export default function App(){
         fetchContacts(); // Refresh contacts list
       }); 
       
-      c.on('error',(e)=>{
+      c.on('error', (e) => {
         console.error('Incoming call error:', e);
-        setErr(e?.message||'Call error');
+        
+        // Handle hangup errors as normal disconnections
+        if (e.code === 31005) {
+          console.log('Incoming call ended with gateway hangup error (31005) - treating as normal hangup');
+          setHist(l => [{
+            id: generateId(),
+            from: c.parameters?.From || 'unknown',
+            direction: 'incoming',
+            status: 'completed',
+            at: new Date().toISOString()
+          }, ...l].slice(0, 100));
+          
+          if (incRef.current === c) incRef.current = null;
+          actRef.current = null;
+          setCallStat('idle');
+          setIsRecording(false);
+          fetchRecordings();
+          fetchTranscriptions();
+          fetchContacts();
+          return; // Don't show error to user
+        }
+        
+        // Handle other errors normally
+        setErr(e?.message || 'Call error');
         setCallStat('idle');
-        if(incRef.current===c) incRef.current=null;
-        actRef.current=null;
-        setIsRecording(false); // Stop recording indicator
+        if (incRef.current === c) incRef.current = null;
+        actRef.current = null;
+        setIsRecording(false);
       });
     } catch (error) {
       console.error('Failed to accept call:', error);
@@ -135,7 +334,7 @@ export default function App(){
   const fetchContacts=async()=>{ try{ const r=await fetch('http://localhost:5001/api/contacts'); const j=await r.json(); if(r.ok) setConversationContacts(j.contacts||[]); }catch(e){ console.error('Failed to fetch contacts:',e); } };
   const fetchContactContext=async(phoneNumber)=>{ try{ const r=await fetch(`http://localhost:5001/api/contacts/${phoneNumber}/context`); const j=await r.json(); if(r.ok) setContactContext(j); }catch(e){ console.error('Failed to fetch contact context:',e); } };
   const generatePreCallBriefing=async(phoneNumber)=>{ try{ const r=await fetch(`http://localhost:5001/api/contacts/${phoneNumber}/prepare`,{method:'POST'}); const j=await r.json(); if(r.ok) return j; }catch(e){ console.error('Failed to generate briefing:',e); return null; } };
-  const addC=(name,phone)=>{ const n=norm(phone); if(!name||!n) return; setContacts(l=>[{id:Date.now(),name,phone:n},...l].slice(0,200)); };
+  const addC=(name,phone)=>{ const n=norm(phone); if(!name||!n) return; setContacts(l=>[{id:generateId(),name,phone:n},...l].slice(0,200)); };
   const devOK=devStat==='ready'; const conn=callStat==='connected';
   return (
     <ErrorBoundary>
@@ -297,7 +496,7 @@ function Transcriptions({transcriptions,showTranscriptions,setShowTranscriptions
                     {t.metadata.topics?.length > 0 && (
                       <div className="flex flex-wrap gap-1 mb-1">
                         {t.metadata.topics.map((topic, i) => (
-                          <span key={i} className="text-xs px-1 py-0.5 bg-blue-100 text-blue-700 rounded">
+                          <span key={`transcription-topic-${t.sid}-${i}-${topic}`} className="text-xs px-1 py-0.5 bg-blue-100 text-blue-700 rounded">
                             {topic}
                           </span>
                         ))}
@@ -428,8 +627,8 @@ function ConversationContacts({contacts, selectedContact, setSelectedContact, co
           )}
           
           <ul className="space-y-2 max-h-64 overflow-auto text-sm">
-            {contacts.map(contact => (
-              <li key={contact.phoneNumber} className="border rounded p-2">
+            {contacts.map((contact, index) => (
+              <li key={`contact-${contact.phoneNumber}-${index}`} className="border rounded p-2">
                 <div className="flex items-center justify-between mb-1">
                   <div className="font-medium text-xs">{formatPhone(contact.phoneNumber)}</div>
                   <div className="text-xs text-slate-500">{contact.totalCalls} calls</div>
@@ -443,7 +642,7 @@ function ConversationContacts({contacts, selectedContact, setSelectedContact, co
                   <div className="mb-2">
                     <div className="flex flex-wrap gap-1">
                       {contact.recentTopics.map((topic, i) => (
-                        <span key={i} className="text-xs px-1 py-0.5 bg-blue-100 text-blue-700 rounded">
+                        <span key={`topic-${contact.phoneNumber}-${i}-${topic}`} className="text-xs px-1 py-0.5 bg-blue-100 text-blue-700 rounded">
                           {topic}
                         </span>
                       ))}

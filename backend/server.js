@@ -6,9 +6,51 @@ const morgan = require("morgan");
 const rateLimit = require("express-rate-limit");
 const dotenv = require("dotenv");
 const Twilio = require("twilio");
+const crypto = require("crypto");
 
 // Load env from project root .env
 dotenv.config({ path: path.resolve(__dirname, "../.env") });
+
+// Environment variable mapping with fallbacks
+function envOr(...names) {
+  for (const n of names) {
+    const v = process.env[n];
+    if (v && String(v).trim() !== '') return v.trim();
+  }
+  return '';
+}
+
+function getTwilioEnv() {
+  const ACCOUNT_SID = envOr('TWILIO_ACCOUNT_SID', 'ACCOUNT_SID');
+  const API_KEY     = envOr('TWILIO_API_KEY', 'TWILIO_API_KEY_SID');      // accept either
+  const API_SECRET  = envOr('TWILIO_API_SECRET', 'TWILIO_API_KEY_SECRET'); // accept either
+  const APP_SID     = envOr('TWILIO_TWIML_APP_SID', 'TWIML_APP_SID');
+  const CALLER_ID   = envOr('TWILIO_VOICE_CALLER_ID', 'CALLER_ID');
+
+  // one-time log on startup to see what's actually loaded
+  if (!global.__TWILIO_ENV_LOGGED__) {
+    global.__TWILIO_ENV_LOGGED__ = true;
+    console.log('TWILIO ENV CHECK', {
+      ACCOUNT_SID: ACCOUNT_SID ? 'set' : 'missing',
+      API_KEY:     API_KEY ? 'set' : 'missing',
+      API_SECRET:  API_SECRET ? 'set' : 'missing',
+      APP_SID:     APP_SID ? 'set' : 'missing',
+      CALLER_ID:   CALLER_ID ? 'set' : 'missing',
+      // optional lengths to ensure not whitespace
+      _debug: {
+        API_KEY_len: API_KEY?.length || 0,
+        API_SECRET_len: API_SECRET?.length || 0,
+      }
+    });
+  }
+
+  return { ACCOUNT_SID, API_KEY, API_SECRET, APP_SID, CALLER_ID };
+}
+
+// Twilio token pieces
+const { jwt } = Twilio;
+const AccessToken = jwt.AccessToken;
+const VoiceGrant = AccessToken.VoiceGrant;
 
 const app = express();
 app.set("trust proxy", 1);
@@ -68,43 +110,35 @@ app.get("/healthz", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
 });
 
-// 1) Access token generation for Twilio Voice SDK
-app.post("/api/token", (req, res, next) => {
+// --- Twilio Voice Access Token endpoint ---
+app.get('/api/token', (req, res) => {
   try {
-    // Only require credentials needed to mint a token
-    const envErr = ensureEnv([
-      "TWILIO_ACCOUNT_SID",
-      "TWILIO_API_KEY_SID",
-      "TWILIO_API_KEY_SECRET",
-    ]);
-    if (envErr) return res.status(500).json({ error: envErr });
+    const { ACCOUNT_SID, API_KEY, API_SECRET, APP_SID } = getTwilioEnv();
 
-    const AccessToken = Twilio.jwt.AccessToken;
-    const VoiceGrant = AccessToken.VoiceGrant;
-
-    // choose identity from query param or random
-    let identity = (req.query.identity || "").trim() || `user_${Math.random().toString(36).slice(2, 10)}`;
-
-    const token = new AccessToken(
-      process.env.TWILIO_ACCOUNT_SID,
-      process.env.TWILIO_API_KEY_SID,
-      process.env.TWILIO_API_KEY_SECRET,
-      {
-        identity,
-        ttl: parseInt(process.env.TOKEN_TTL_SECONDS || "3600", 10),
-      }
-    );
-
-    // Voice grant: allow incoming; add outgoing app SID only if provided
-    const voiceGrantOptions = { incomingAllow: true };
-    if (process.env.TWILIO_TWIML_APP_SID) {
-      voiceGrantOptions.outgoingApplicationSid = process.env.TWILIO_TWIML_APP_SID;
+    const missing = [];
+    if (!ACCOUNT_SID) missing.push('TWILIO_ACCOUNT_SID');
+    if (!API_KEY)     missing.push('TWILIO_API_KEY (or TWILIO_API_KEY_SID)');
+    if (!API_SECRET)  missing.push('TWILIO_API_SECRET (or TWILIO_API_KEY_SECRET)');
+    if (!APP_SID)     missing.push('TWILIO_TWIML_APP_SID');
+    if (missing.length) {
+      return res.status(500).json({ error: 'Missing Twilio env vars', missing });
     }
-    const voiceGrant = new VoiceGrant(voiceGrantOptions);
-    token.addGrant(voiceGrant);
 
-    res.json({ token: token.toJwt(), identity });
-  } catch (err) { next(err); }
+    const identity = req.query.identity || `user_${Math.random().toString(16).slice(2,10)}`;
+    const ttl = Number(process.env.TOKEN_TTL_SECONDS || 3600);
+
+    const token = new AccessToken(ACCOUNT_SID, API_KEY, API_SECRET, { identity, ttl });
+    const grant = new VoiceGrant({
+      outgoingApplicationSid: APP_SID,
+      incomingAllow: true,
+    });
+    token.addGrant(grant);
+
+    return res.json({ token: token.toJwt(), identity, ttl });
+  } catch (err) {
+    console.error('Token error detail:', err?.message, err?.stack);
+    return res.status(500).json({ error: 'Token generation failed', detail: String(err?.message || err) });
+  }
 });
 
 // 2) TwiML responses for outgoing calls
@@ -1370,6 +1404,30 @@ app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
   res.status(err.status || 500).json({ error: err.message || "Internal Server Error" });
 });
+
+// Memory management for production
+if (process.env.NODE_ENV === 'production') {
+  // Clean up old data every 24 hours
+  setInterval(() => {
+    const oneWeekAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+    
+    // Clean old recordings
+    for (const [key, value] of recordings.entries()) {
+      if (new Date(value.createdAt).getTime() < oneWeekAgo) {
+        recordings.delete(key);
+      }
+    }
+    
+    // Clean old transcriptions
+    for (const [key, value] of transcriptions.entries()) {
+      if (new Date(value.createdAt).getTime() < oneWeekAgo) {
+        transcriptions.delete(key);
+      }
+    }
+    
+    console.log('Memory cleanup completed');
+  }, 24 * 60 * 60 * 1000); // Daily cleanup
+}
 
 const PORT = parseInt(process.env.PORT || "5001", 10);
 app.listen(PORT, () => {
